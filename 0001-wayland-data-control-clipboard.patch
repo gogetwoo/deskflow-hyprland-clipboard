@@ -1,0 +1,820 @@
+From aede4e0fb0408c68ec3551696171a67b6a761523 Mon Sep 17 00:00:00 2001
+From: gogetwoo <heavensgate82@gmail.com>
+Date: Tue, 27 Oct 2026 21:31:51 -0500
+Subject: [PATCH] platform: wayland data-control clipboard fallback for portals
+ without a Clipboard interface
+
+xdg-desktop-portal-hyprland (InputCapture v1) has no Clipboard interface,
+so the server ran without clipboard sharing. When the portal session reports
+no clipboard, fall back to ext-data-control-v1: read the local selection when
+input capture activates, and offer the remote clipboard locally when a client
+grabs it. Format conversion reuses PortalClipboard.
+---
+ src/lib/platform/CMakeLists.txt           |  28 ++
+ src/lib/platform/DataControlClipboard.cpp | 387 ++++++++++++++++++++++
+ src/lib/platform/DataControlClipboard.h   | 111 +++++++
+ src/lib/platform/EiComputer.cpp           |   5 +-
+ src/lib/platform/PortalInputCapture.cpp   | 133 +++++++-
+ src/lib/platform/PortalInputCapture.h     |   7 +
+ 6 files changed, 669 insertions(+), 2 deletions(-)
+ create mode 100644 src/lib/platform/DataControlClipboard.cpp
+ create mode 100644 src/lib/platform/DataControlClipboard.h
+
+diff --git a/src/lib/platform/CMakeLists.txt b/src/lib/platform/CMakeLists.txt
+index 59f869e..f71bfcd 100644
+--- a/src/lib/platform/CMakeLists.txt
++++ b/src/lib/platform/CMakeLists.txt
+@@ -166,6 +166,29 @@ elseif(UNIX)
+           PortalClipboard.cpp
+           PortalClipboard.h
+         )
++        # Clipboard fallback for portals without a Clipboard interface (e.g. Hyprland)
++        pkg_check_modules(WAYLAND_CLIENT IMPORTED_TARGET wayland-client)
++        pkg_check_modules(WAYLAND_PROTOCOLS wayland-protocols>=1.39)
++        find_program(WAYLAND_SCANNER wayland-scanner)
++        if(WAYLAND_CLIENT_FOUND AND WAYLAND_PROTOCOLS_FOUND AND WAYLAND_SCANNER)
++          pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
++          set(EXT_DATA_CONTROL_XML ${WAYLAND_PROTOCOLS_DIR}/staging/ext-data-control/ext-data-control-v1.xml)
++          set(EXT_DATA_CONTROL_H ${CMAKE_CURRENT_BINARY_DIR}/ext-data-control-v1-client-protocol.h)
++          set(EXT_DATA_CONTROL_C ${CMAKE_CURRENT_BINARY_DIR}/ext-data-control-v1-protocol.c)
++          add_custom_command(
++            OUTPUT ${EXT_DATA_CONTROL_H} ${EXT_DATA_CONTROL_C}
++            COMMAND ${WAYLAND_SCANNER} client-header ${EXT_DATA_CONTROL_XML} ${EXT_DATA_CONTROL_H}
++            COMMAND ${WAYLAND_SCANNER} private-code ${EXT_DATA_CONTROL_XML} ${EXT_DATA_CONTROL_C}
++            DEPENDS ${EXT_DATA_CONTROL_XML}
++          )
++          list(APPEND PLATFORM_SOURCES
++            DataControlClipboard.cpp
++            DataControlClipboard.h
++            ${EXT_DATA_CONTROL_H}
++            ${EXT_DATA_CONTROL_C}
++          )
++          set(HAVE_DATA_CONTROL TRUE)
++        endif()
+       endif()
+       if(HAVE_LP_SHORTCUTS)
+         list(APPEND PLATFORM_SOURCES
+@@ -199,6 +222,11 @@ if(UNIX)
+     if (HAVE_LP_CLIPBOARD)
+       target_compile_definitions(platform PUBLIC HAVE_LIBPORTAL_CLIPBOARD)
+     endif()
++    if (HAVE_DATA_CONTROL)
++      target_compile_definitions(platform PRIVATE HAVE_DATA_CONTROL)
++      target_include_directories(platform PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
++      target_link_libraries(platform PRIVATE PkgConfig::WAYLAND_CLIENT)
++    endif()
+     if (HAVE_LP_SHORTCUTS)
+       target_compile_definitions(platform PUBLIC HAVE_LIBPORTAL_SHORTCUTS)
+     endif()
+diff --git a/src/lib/platform/DataControlClipboard.cpp b/src/lib/platform/DataControlClipboard.cpp
+new file mode 100644
+index 0000000..3b3c92c
+--- /dev/null
++++ b/src/lib/platform/DataControlClipboard.cpp
+@@ -0,0 +1,387 @@
++/*
++ * Deskflow -- mouse and keyboard sharing utility
++ * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++ */
++
++#include "platform/DataControlClipboard.h"
++
++#include "base/Log.h"
++
++#include "ext-data-control-v1-client-protocol.h"
++#include <wayland-client.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <cstring>
++#include <fcntl.h>
++#include <future>
++#include <poll.h>
++#include <unistd.h>
++
++namespace deskflow {
++
++static constexpr int kReadTimeoutMs = 200;
++static constexpr int kWriteTimeoutMs = 200;
++static constexpr qint64 kChunkBytes = 64 * 1024;
++
++std::unique_ptr<DataControlClipboard> DataControlClipboard::create()
++{
++  std::unique_ptr<DataControlClipboard> clipboard(new DataControlClipboard());
++  if (!clipboard->connect())
++    return nullptr;
++
++  clipboard->m_running = true;
++  clipboard->m_thread = std::thread(&DataControlClipboard::run, clipboard.get());
++  return clipboard;
++}
++
++bool DataControlClipboard::connect()
++{
++  m_display = wl_display_connect(nullptr);
++  if (!m_display) {
++    LOG_DEBUG("data-control clipboard: no wayland display");
++    return false;
++  }
++
++  static const wl_registry_listener registryListener = {
++      &DataControlClipboard::onGlobal, &DataControlClipboard::onGlobalRemove
++  };
++  m_registry = wl_display_get_registry(m_display);
++  wl_registry_add_listener(m_registry, &registryListener, this);
++  wl_display_roundtrip(m_display);
++
++  if (!m_manager || !m_seat) {
++    LOG_DEBUG("data-control clipboard: compositor has no ext_data_control_manager_v1");
++    return false;
++  }
++
++  static const ext_data_control_device_v1_listener deviceListener = {
++      &DataControlClipboard::onDataOffer, &DataControlClipboard::onSelection, &DataControlClipboard::onFinished,
++      &DataControlClipboard::onPrimarySelection
++  };
++  m_device = ext_data_control_manager_v1_get_data_device(m_manager, m_seat);
++  ext_data_control_device_v1_add_listener(m_device, &deviceListener, this);
++
++  // Picks up the current selection before the thread starts.
++  wl_display_roundtrip(m_display);
++
++  if (pipe2(m_wakeFds, O_CLOEXEC | O_NONBLOCK) != 0) {
++    LOG_WARN("data-control clipboard: failed to create wake pipe: %s", strerror(errno));
++    return false;
++  }
++
++  LOG_INFO("using wayland data-control for clipboard sharing");
++  return true;
++}
++
++DataControlClipboard::~DataControlClipboard()
++{
++  if (m_thread.joinable()) {
++    post([this] { m_stop = true; });
++    m_thread.join();
++  }
++
++  for (auto &offer : m_pendingOffers)
++    destroyOffer(offer.get());
++  if (m_selection)
++    destroyOffer(m_selection.get());
++  if (m_source)
++    ext_data_control_source_v1_destroy(m_source);
++  if (m_device)
++    ext_data_control_device_v1_destroy(m_device);
++  if (m_manager)
++    ext_data_control_manager_v1_destroy(m_manager);
++  if (m_seat)
++    wl_seat_destroy(m_seat);
++  if (m_registry)
++    wl_registry_destroy(m_registry);
++  if (m_display)
++    wl_display_disconnect(m_display);
++
++  for (int fd : m_wakeFds) {
++    if (fd >= 0)
++      ::close(fd);
++  }
++}
++
++std::vector<std::string> DataControlClipboard::selectionMimeTypes() const
++{
++  std::lock_guard lock(m_mutex);
++  return m_selectionMimes;
++}
++
++bool DataControlClipboard::ownsSelection() const
++{
++  std::lock_guard lock(m_mutex);
++  return m_ownsSelection;
++}
++
++QByteArray DataControlClipboard::read(const std::string &mime, qint64 maxBytes)
++{
++  auto readFd = std::make_shared<std::promise<int>>();
++  auto future = readFd->get_future();
++
++  const bool posted = post([this, mime, readFd] {
++    if (!m_selection) {
++      readFd->set_value(-1);
++      return;
++    }
++
++    int fds[2];
++    if (pipe2(fds, O_CLOEXEC) != 0) {
++      LOG_WARN("data-control clipboard: failed to create pipe: %s", strerror(errno));
++      readFd->set_value(-1);
++      return;
++    }
++
++    ext_data_control_offer_v1_receive(m_selection->proxy, mime.c_str(), fds[1]);
++    wl_display_flush(m_display);
++    ::close(fds[1]);
++    readFd->set_value(fds[0]);
++  });
++  if (!posted)
++    return {};
++
++  const int fd = future.get();
++  if (fd < 0)
++    return {};
++
++  QByteArray contents;
++  char buf[kChunkBytes];
++  while (contents.size() < maxBytes) {
++    pollfd pfd{fd, POLLIN, 0};
++    if (poll(&pfd, 1, kReadTimeoutMs) <= 0)
++      break;
++
++    const auto n = ::read(fd, buf, static_cast<size_t>(std::min<qint64>(kChunkBytes, maxBytes - contents.size())));
++    if (n <= 0)
++      break;
++
++    contents.append(buf, n);
++  }
++
++  ::close(fd);
++  return contents;
++}
++
++void DataControlClipboard::setSelection(const std::vector<std::string> &mimes, Provider provider)
++{
++  post([this, mimes, provider = std::move(provider)]() mutable {
++    static const ext_data_control_source_v1_listener sourceListener = {
++        &DataControlClipboard::onSourceSend, &DataControlClipboard::onSourceCancelled
++    };
++
++    if (m_source)
++      ext_data_control_source_v1_destroy(m_source);
++
++    m_source = ext_data_control_manager_v1_create_data_source(m_manager);
++    ext_data_control_source_v1_add_listener(m_source, &sourceListener, this);
++    for (const auto &mime : mimes)
++      ext_data_control_source_v1_offer(m_source, mime.c_str());
++
++    m_provider = std::move(provider);
++    ext_data_control_device_v1_set_selection(m_device, m_source);
++
++    std::lock_guard lock(m_mutex);
++    m_ownsSelection = true;
++  });
++}
++
++bool DataControlClipboard::post(std::function<void()> task)
++{
++  {
++    std::lock_guard lock(m_mutex);
++    if (!m_running)
++      return false;
++    m_tasks.push_back(std::move(task));
++  }
++
++  const char byte = 1;
++  [[maybe_unused]] auto n = ::write(m_wakeFds[1], &byte, 1);
++  return true;
++}
++
++void DataControlClipboard::drainTasks()
++{
++  char buf[64];
++  while (::read(m_wakeFds[0], buf, sizeof(buf)) > 0) {
++  }
++
++  std::deque<std::function<void()>> tasks;
++  {
++    std::lock_guard lock(m_mutex);
++    tasks.swap(m_tasks);
++  }
++  for (auto &task : tasks)
++    task();
++}
++
++void DataControlClipboard::run()
++{
++  const int displayFd = wl_display_get_fd(m_display);
++
++  while (!m_stop) {
++    while (wl_display_prepare_read(m_display) != 0)
++      wl_display_dispatch_pending(m_display);
++    wl_display_flush(m_display);
++
++    pollfd fds[2] = {{displayFd, POLLIN, 0}, {m_wakeFds[0], POLLIN, 0}};
++    if (poll(fds, 2, -1) < 0) {
++      wl_display_cancel_read(m_display);
++      if (errno == EINTR)
++        continue;
++      LOG_ERR("data-control clipboard: poll failed: %s", strerror(errno));
++      break;
++    }
++
++    if (fds[0].revents & (POLLERR | POLLHUP)) {
++      wl_display_cancel_read(m_display);
++      LOG_ERR("data-control clipboard: wayland connection lost");
++      break;
++    }
++
++    if (fds[0].revents & POLLIN)
++      wl_display_read_events(m_display);
++    else
++      wl_display_cancel_read(m_display);
++    wl_display_dispatch_pending(m_display);
++
++    if (fds[1].revents & POLLIN)
++      drainTasks();
++  }
++
++  // Refuse new tasks, then run what was queued so no reader is left waiting.
++  {
++    std::lock_guard lock(m_mutex);
++    m_running = false;
++  }
++  drainTasks();
++}
++
++void DataControlClipboard::destroyOffer(Offer *offer)
++{
++  if (offer && offer->proxy) {
++    ext_data_control_offer_v1_destroy(offer->proxy);
++    offer->proxy = nullptr;
++  }
++}
++
++void DataControlClipboard::onGlobal(
++    void *data, wl_registry *registry, uint32_t name, const char *interface, uint32_t version
++)
++{
++  auto *self = static_cast<DataControlClipboard *>(data);
++  if (strcmp(interface, wl_seat_interface.name) == 0 && !self->m_seat) {
++    self->m_seat = static_cast<wl_seat *>(wl_registry_bind(registry, name, &wl_seat_interface, 1));
++  } else if (strcmp(interface, ext_data_control_manager_v1_interface.name) == 0) {
++    self->m_manager = static_cast<ext_data_control_manager_v1 *>(
++        wl_registry_bind(registry, name, &ext_data_control_manager_v1_interface, std::min<uint32_t>(version, 1))
++    );
++  }
++}
++
++void DataControlClipboard::onGlobalRemove(void *, wl_registry *, uint32_t)
++{
++  // nothing to do
++}
++
++void DataControlClipboard::onDataOffer(void *data, ext_data_control_device_v1 *, ext_data_control_offer_v1 *proxy)
++{
++  static const ext_data_control_offer_v1_listener offerListener = {&DataControlClipboard::onOfferMime};
++
++  auto *self = static_cast<DataControlClipboard *>(data);
++  auto offer = std::make_unique<Offer>();
++  offer->proxy = proxy;
++  ext_data_control_offer_v1_add_listener(proxy, &offerListener, offer.get());
++  self->m_pendingOffers.push_back(std::move(offer));
++}
++
++void DataControlClipboard::onSelection(void *data, ext_data_control_device_v1 *, ext_data_control_offer_v1 *proxy)
++{
++  auto *self = static_cast<DataControlClipboard *>(data);
++
++  if (self->m_selection)
++    self->destroyOffer(self->m_selection.get());
++  self->m_selection.reset();
++
++  auto it = std::find_if(self->m_pendingOffers.begin(), self->m_pendingOffers.end(), [proxy](const auto &offer) {
++    return offer->proxy == proxy;
++  });
++  if (proxy && it != self->m_pendingOffers.end()) {
++    self->m_selection = std::move(*it);
++    self->m_pendingOffers.erase(it);
++  }
++
++  std::lock_guard lock(self->m_mutex);
++  self->m_selectionMimes = self->m_selection ? self->m_selection->mimes : std::vector<std::string>{};
++}
++
++void DataControlClipboard::onFinished(void *data, ext_data_control_device_v1 *)
++{
++  auto *self = static_cast<DataControlClipboard *>(data);
++  LOG_WARN("data-control clipboard: device finished, clipboard sharing stopped");
++  ext_data_control_device_v1_destroy(self->m_device);
++  self->m_device = nullptr;
++  self->m_stop = true;
++}
++
++void DataControlClipboard::onPrimarySelection(void *data, ext_data_control_device_v1 *, ext_data_control_offer_v1 *proxy)
++{
++  // Only the regular clipboard is shared; drop primary-selection offers.
++  auto *self = static_cast<DataControlClipboard *>(data);
++  if (!proxy)
++    return;
++
++  auto it = std::find_if(self->m_pendingOffers.begin(), self->m_pendingOffers.end(), [proxy](const auto &offer) {
++    return offer->proxy == proxy;
++  });
++  if (it != self->m_pendingOffers.end()) {
++    self->destroyOffer(it->get());
++    self->m_pendingOffers.erase(it);
++  }
++}
++
++void DataControlClipboard::onOfferMime(void *data, ext_data_control_offer_v1 *, const char *mime)
++{
++  static_cast<Offer *>(data)->mimes.emplace_back(mime);
++}
++
++void DataControlClipboard::onSourceSend(void *data, ext_data_control_source_v1 *, const char *mime, int32_t fd)
++{
++  auto *self = static_cast<DataControlClipboard *>(data);
++  const auto bytes = self->m_provider ? self->m_provider(mime) : QByteArray();
++
++  qint64 written = 0;
++  while (written < bytes.size()) {
++    pollfd pfd{fd, POLLOUT, 0};
++    if (poll(&pfd, 1, kWriteTimeoutMs) <= 0) {
++      LOG_ERR("data-control clipboard: timed out writing selection");
++      break;
++    }
++
++    const auto n = ::write(fd, bytes.constData() + written, static_cast<size_t>(bytes.size() - written));
++    if (n <= 0) {
++      LOG_ERR("data-control clipboard: write failed: %s", strerror(errno));
++      break;
++    }
++    written += n;
++  }
++
++  ::close(fd);
++  LOG_DEBUG("data-control clipboard: served %s, bytes: %lld", mime, static_cast<long long>(written));
++}
++
++void DataControlClipboard::onSourceCancelled(void *data, ext_data_control_source_v1 *source)
++{
++  auto *self = static_cast<DataControlClipboard *>(data);
++  ext_data_control_source_v1_destroy(source);
++  if (self->m_source == source) {
++    self->m_source = nullptr;
++    self->m_provider = nullptr;
++
++    std::lock_guard lock(self->m_mutex);
++    self->m_ownsSelection = false;
++  }
++}
++
++} // namespace deskflow
+diff --git a/src/lib/platform/DataControlClipboard.h b/src/lib/platform/DataControlClipboard.h
+new file mode 100644
+index 0000000..aae7c29
+--- /dev/null
++++ b/src/lib/platform/DataControlClipboard.h
+@@ -0,0 +1,111 @@
++/*
++ * Deskflow -- mouse and keyboard sharing utility
++ * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++ */
++
++#pragma once
++
++#include <QByteArray>
++
++#include <condition_variable>
++#include <deque>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++struct wl_display;
++struct wl_registry;
++struct wl_seat;
++struct ext_data_control_manager_v1;
++struct ext_data_control_device_v1;
++struct ext_data_control_offer_v1;
++struct ext_data_control_source_v1;
++
++namespace deskflow {
++
++//! Wayland clipboard access through ext-data-control-v1
++/*!
++Fallback for compositors whose portal backend has no Clipboard interface
++(e.g. Hyprland with xdg-desktop-portal-hyprland). It opens its own Wayland
++connection and does every protocol call on one private thread, so callers on
++any thread only ever touch plain data.
++*/
++class DataControlClipboard
++{
++public:
++  //! Returns bytes for a mime type, called on the clipboard thread
++  using Provider = std::function<QByteArray(const std::string &mime)>;
++
++  //! Connect and bind ext_data_control_manager_v1; nullptr if unavailable
++  static std::unique_ptr<DataControlClipboard> create();
++
++  ~DataControlClipboard();
++
++  DataControlClipboard(const DataControlClipboard &) = delete;
++  DataControlClipboard &operator=(const DataControlClipboard &) = delete;
++
++  //! Mime types offered by the current selection (empty if none)
++  std::vector<std::string> selectionMimeTypes() const;
++
++  //! True while our own source is the selection
++  bool ownsSelection() const;
++
++  //! Read the current selection in \p mime, up to \p maxBytes
++  QByteArray read(const std::string &mime, qint64 maxBytes);
++
++  //! Become the selection, serving \p mimes from \p provider on demand
++  void setSelection(const std::vector<std::string> &mimes, Provider provider);
++
++private:
++  struct Offer
++  {
++    ext_data_control_offer_v1 *proxy = nullptr;
++    std::vector<std::string> mimes;
++  };
++
++  DataControlClipboard() = default;
++  bool connect();
++  void run();
++  bool post(std::function<void()> task);
++  void drainTasks();
++  void destroyOffer(Offer *offer);
++
++  // Wayland listener trampolines
++  static void onGlobal(void *data, wl_registry *, uint32_t name, const char *interface, uint32_t version);
++  static void onGlobalRemove(void *, wl_registry *, uint32_t);
++  static void onDataOffer(void *data, ext_data_control_device_v1 *, ext_data_control_offer_v1 *offer);
++  static void onSelection(void *data, ext_data_control_device_v1 *, ext_data_control_offer_v1 *offer);
++  static void onFinished(void *data, ext_data_control_device_v1 *);
++  static void onPrimarySelection(void *, ext_data_control_device_v1 *, ext_data_control_offer_v1 *offer);
++  static void onOfferMime(void *data, ext_data_control_offer_v1 *, const char *mime);
++  static void onSourceSend(void *data, ext_data_control_source_v1 *source, const char *mime, int32_t fd);
++  static void onSourceCancelled(void *data, ext_data_control_source_v1 *source);
++
++  wl_display *m_display = nullptr;
++  wl_registry *m_registry = nullptr;
++  wl_seat *m_seat = nullptr;
++  ext_data_control_manager_v1 *m_manager = nullptr;
++  ext_data_control_device_v1 *m_device = nullptr;
++
++  // Clipboard-thread state
++  std::vector<std::unique_ptr<Offer>> m_pendingOffers;
++  std::unique_ptr<Offer> m_selection;
++  ext_data_control_source_v1 *m_source = nullptr;
++  Provider m_provider;
++
++  // Shared with callers, guarded by m_mutex
++  mutable std::mutex m_mutex;
++  std::vector<std::string> m_selectionMimes;
++  bool m_ownsSelection = false;
++  std::deque<std::function<void()>> m_tasks;
++  bool m_running = false;
++
++  int m_wakeFds[2] = {-1, -1};
++  bool m_stop = false;
++  std::thread m_thread;
++};
++
++} // namespace deskflow
+diff --git a/src/lib/platform/EiComputer.cpp b/src/lib/platform/EiComputer.cpp
+index 80b1633..86c681b 100644
+--- a/src/lib/platform/EiComputer.cpp
++++ b/src/lib/platform/EiComputer.cpp
+@@ -491,7 +491,10 @@ bool EiComputer::setClipboard(ClipboardID id, const IClipboard *clipboard)
+     if (!targetClipboard) {
+       return false;
+     }
+-    return IClipboard::copy(targetClipboard, clipboard);
++    const bool ok = IClipboard::copy(targetClipboard, clipboard);
++    if (ok && id == kClipboardClipboard)
++      m_portalInputCapture->clipboardChanged();
++    return ok;
+   }
+ 
+   // Otherwise use our own clipboard
+diff --git a/src/lib/platform/PortalInputCapture.cpp b/src/lib/platform/PortalInputCapture.cpp
+index 54bceef..7ca6b7c 100644
+--- a/src/lib/platform/PortalInputCapture.cpp
++++ b/src/lib/platform/PortalInputCapture.cpp
+@@ -18,6 +18,15 @@
+ #ifdef HAVE_LIBPORTAL_CLIPBOARD
+ #include "platform/PortalClipboard.h"
+ #endif
++#ifdef HAVE_DATA_CONTROL
++#include "platform/DataControlClipboard.h"
++#else
++namespace deskflow {
++class DataControlClipboard
++{
++};
++} // namespace deskflow
++#endif
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -32,6 +41,9 @@
+ #include <QDataStream>
+ #include <QFile>
+ #include <QImage>
++#include <QList>
++#include <QPair>
++#include <QSet>
+ #include <QtEndian>
+ 
+ namespace deskflow {
+@@ -189,6 +201,9 @@ PortalInputCapture::PortalInputCapture(EiComputer *computer, IEventQueue *events
+ 
+ PortalInputCapture::~PortalInputCapture()
+ {
++  // Stop the clipboard thread before the cache it serves from goes away.
++  m_dataControl.reset();
++
+   if (g_main_loop_is_running(m_glibMainLoop))
+     g_main_loop_quit(m_glibMainLoop);
+ 
+@@ -256,6 +271,106 @@ void PortalInputCapture::claimClipboardOwnership([[maybe_unused]] XdpSession *se
+ #endif
+ }
+ 
++void PortalInputCapture::readDataControlSelection() const
++{
++#if defined(HAVE_DATA_CONTROL) && defined(HAVE_LIBPORTAL_CLIPBOARD)
++  struct MimeFormat
++  {
++    const char *mime;
++    IClipboard::Format format;
++  };
++  // Richer formats first; later entries only fill formats not read yet.
++  static constexpr MimeFormat kMimes[] = {
++      {"image/png", IClipboard::Format::Bitmap},
++      {"text/html", IClipboard::Format::HTML},
++      {"text/plain;charset=utf-8", IClipboard::Format::Text},
++      {"text/plain", IClipboard::Format::Text},
++      {"UTF8_STRING", IClipboard::Format::Text},
++  };
++
++  const auto available = m_dataControl->selectionMimeTypes();
++  if (available.empty()) {
++    LOG_DEBUG("no current data-control clipboard selection");
++    return;
++  }
++
++  const qint64 maxBytes = static_cast<qint64>(m_computer->maximumClipboardSize()) * 1024;
++  QList<QPair<IClipboard::Format, QByteArray>> reads;
++  QSet<IClipboard::Format> seen;
++  for (const auto &entry : kMimes) {
++    if (seen.contains(entry.format) || std::ranges::find(available, entry.mime) == available.end())
++      continue;
++
++    auto bytes = m_dataControl->read(entry.mime, maxBytes);
++    if (entry.format != IClipboard::Format::Bitmap) {
++      while (bytes.endsWith('\0'))
++        bytes.chop(1);
++      bytes.replace("\r\n", "\n");
++    }
++
++    auto data = PortalClipboard::decodeFormat(entry.format, bytes);
++    if (data.isEmpty())
++      continue;
++
++    reads.append({entry.format, std::move(data)});
++    seen.insert(entry.format);
++  }
++
++  if (reads.isEmpty()) {
++    LOG_DEBUG("data-control clipboard read produced no data, leaving existing clipboard intact");
++    return;
++  }
++
++  m_clipboard->open(0);
++  m_clipboard->empty();
++  for (const auto &[format, data] : reads)
++    m_clipboard->add(format, data.toStdString());
++  m_clipboard->close();
++  LOG_DEBUG("data-control clipboard read local selection, formats: %lld", static_cast<long long>(reads.size()));
++#endif
++}
++
++void PortalInputCapture::clipboardChanged()
++{
++#if defined(HAVE_DATA_CONTROL) && defined(HAVE_LIBPORTAL_CLIPBOARD)
++  if (!m_dataControl)
++    return;
++
++  std::vector<std::string> mimes;
++  m_clipboard->open(0);
++  if (m_clipboard->has(IClipboard::Format::Bitmap))
++    mimes.emplace_back("image/png");
++  if (m_clipboard->has(IClipboard::Format::HTML))
++    mimes.emplace_back("text/html");
++  if (m_clipboard->has(IClipboard::Format::Text)) {
++    for (const char *mime : {"text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT"})
++      mimes.emplace_back(mime);
++  }
++  m_clipboard->close();
++
++  if (mimes.empty()) {
++    LOG_DEBUG("clipboard cache empty, nothing to offer via data-control");
++    return;
++  }
++
++  LOG_DEBUG("offering clipboard via data-control, mimes: %zu", mimes.size());
++  m_dataControl->setSelection(mimes, [this](const std::string &mime) {
++    IClipboard::Format format = IClipboard::Format::Text;
++    if (mime == "image/png")
++      format = IClipboard::Format::Bitmap;
++    else if (mime == "text/html")
++      format = IClipboard::Format::HTML;
++
++    m_clipboard->open(0);
++    QByteArray raw;
++    if (m_clipboard->has(format))
++      raw = QByteArray::fromStdString(m_clipboard->get(format));
++    m_clipboard->close();
++    return PortalClipboard::encodeFormat(format, raw);
++  });
++#endif
++}
++
+ void PortalInputCapture::readClipboardSelection(XdpSession *session) const
+ {
+ #ifdef HAVE_LIBPORTAL_CLIPBOARD
+@@ -312,6 +427,14 @@ void PortalInputCapture::setupSession(XdpInputCaptureSession *session)
+       return;
+     }
+   }
++
++#ifdef HAVE_DATA_CONTROL
++  if (!xdp_session_is_clipboard_enabled(parentSession) && !m_dataControl) {
++    m_dataControl = DataControlClipboard::create();
++    if (!m_dataControl)
++      LOG_WARN("portal has no clipboard and wayland data-control is unavailable, clipboard sharing disabled");
++  }
++#endif
+ #endif
+ 
+   auto fd = xdp_input_capture_session_connect_to_eis(session, &error);
+@@ -740,7 +863,15 @@ void PortalInputCapture::handleActivated(
+   m_isActive = true;
+ 
+ #ifdef HAVE_LIBPORTAL_CLIPBOARD
+-  if (m_session) {
++#ifdef HAVE_DATA_CONTROL
++  if (m_dataControl) {
++    LOG_DEBUG("reading data-control clipboard selection on activation");
++    if (!m_dataControl->ownsSelection())
++      readDataControlSelection();
++    m_computer->sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardClipboard);
++  } else
++#endif
++      if (m_session) {
+     LOG_DEBUG("reading clipboard selection on activation");
+     m_computer->sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardClipboard);
+ 
+diff --git a/src/lib/platform/PortalInputCapture.h b/src/lib/platform/PortalInputCapture.h
+index 062c56e..c2ed9db 100644
+--- a/src/lib/platform/PortalInputCapture.h
++++ b/src/lib/platform/PortalInputCapture.h
+@@ -19,11 +19,13 @@
+ 
+ #include <cstdint>
+ #include <map>
++#include <memory>
+ #include <utility>
+ #include <vector>
+ 
+ namespace deskflow {
+ 
++class DataControlClipboard;
+ class EiClipboard;
+ 
+ class PortalInputCapture
+@@ -34,6 +36,8 @@ public:
+ 
+   // Get the clipboard for the specified ID
+   EiClipboard *getClipboard(ClipboardID id) const;
++  // Offer the clipboard cache locally after a remote computer filled it
++  void clipboardChanged();
+   void enable();
+   void disable();
+   void release();
+@@ -61,6 +65,7 @@ private:
+   void handleSelectionTransfer(XdpSession *session, const char *mimeType, uint32_t serial) const;
+   void readClipboardSelection(XdpSession *session) const;
+   void claimClipboardOwnership(XdpSession *session) const;
++  void readDataControlSelection() const;
+ 
+   /// g_signal_connect callback wrapper
+   static void sessionClosed(XdpSession *session, const gpointer data)
+@@ -172,6 +177,8 @@ private:
+   std::vector<BarrierInfo> m_barrierInfo;
+ 
+   EiClipboard *m_clipboard = nullptr;
++  // Clipboard fallback when the portal backend has no Clipboard interface
++  std::unique_ptr<DataControlClipboard> m_dataControl;
+ };
+ 
+ } // namespace deskflow
+-- 
+2.56.0
+
