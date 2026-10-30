@@ -41,9 +41,29 @@ INFO: using wayland data-control for clipboard sharing
   doesn't provide yet; this patch doesn't change that.
 - Regular clipboard only, not the primary (middle-click) selection.
 
+## Bonus patch: screen switching from every monitor edge
+
+`0002-portal-barriers-on-exterior-edges.patch` fixes a second Hyprland/Wayland server issue that
+shows up with monitors of different sizes.
+
+Deskflow 1.27 only creates InputCapture pointer barriers on the edges of the **bounding box** of all
+monitors. If the monitors don't line up, part of the desktop's outer edge never gets a barrier. Example:
+a 2560x1080 ultrawide at `0,0` beside a portrait 1080x1920 at `2560,-420`. The bounding box bottom is
+the portrait monitor's bottom (y=1500), so a client linked `down` was reachable only from the portrait
+monitor, never from the ultrawide.
+
+The patch instead adds a barrier on every monitor edge that no other monitor touches. That is exactly
+what `xdg-desktop-portal-hyprland` accepts (it rejects barriers on internal seams), so seams still get
+no barrier. Deskflow's existing release logic already picks the nearest barrier on a side, so coming
+back from the client puts the cursor on whichever monitor it's under.
+
+- Tested: the layout above, with a client linked `down`. Both bottom barriers are accepted and
+  switching works from both monitors, in both directions.
+- Layouts whose outer edges already line up behave exactly as before.
+
 ## Install (Arch Linux)
 
-`PKGBUILD` is Arch's official `deskflow` recipe plus this patch (pkgrel `2.1`, adds `wayland` and
+`PKGBUILD` is Arch's official `deskflow` recipe plus both patches (pkgrel `2.2`, adds `wayland` and
 `wayland-protocols`).
 
 ```bash
@@ -68,12 +88,13 @@ and only then lift the hold.
 
 ## Other distros / building from source
 
-The patch applies to Deskflow tag `v1.27.0`:
+The patches apply to Deskflow tag `v1.27.0`, in order:
 
 ```bash
 git clone --branch v1.27.0 https://github.com/deskflow/deskflow
 cd deskflow
 git apply ../0001-wayland-data-control-clipboard.patch
+git apply ../0002-portal-barriers-on-exterior-edges.patch   # optional, see above
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ```
 
@@ -85,12 +106,12 @@ usual dependencies (libei, libportal with clipboard support, Qt 6).
 The real long-term fix is a Clipboard portal in `xdg-desktop-portal-hyprland`, which first needs
 RemoteDesktop portal support
 ([hyprwm/xdg-desktop-portal-hyprland#252](https://github.com/hyprwm/xdg-desktop-portal-hyprland/issues/252)).
-Once that lands, stock Deskflow should work and this patch can be retired.
+Once that lands, stock Deskflow should work and the clipboard patch can be retired.
 
 ## Credits and license
 
-- Patch written with Claude Code (Anthropic's AI coding assistant), then reviewed, built and tested on real hardware.
-- Deskflow is © its contributors, GPL-2.0-only WITH LicenseRef-OpenSSL-Exception. This patch is
+- Patches written with Claude Code (Anthropic's AI coding assistant), then reviewed, built and tested on real hardware.
+- Deskflow is © its contributors, GPL-2.0-only WITH LicenseRef-OpenSSL-Exception. These patches are
   under the same terms; see `LICENSE` (GPL-2.0).
 - `PKGBUILD` is derived from Arch Linux's
   [deskflow packaging](https://gitlab.archlinux.org/archlinux/packaging/packages/deskflow).

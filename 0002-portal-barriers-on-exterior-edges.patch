@@ -1,0 +1,132 @@
+diff --git i/src/lib/platform/PortalInputCapture.cpp w/src/lib/platform/PortalInputCapture.cpp
+index 7ca6b7c..b96f5f8 100644
+--- i/src/lib/platform/PortalInputCapture.cpp
++++ w/src/lib/platform/PortalInputCapture.cpp
+@@ -34,6 +34,7 @@ class DataControlClipboard
+ #include <poll.h>
+ #include <sys/socket.h> // for EIS fd hack, remove
+ #include <sys/un.h>     // for EIS fd hack, remove
++#include <vector>
+ 
+ #include <QBuffer>
+ #include <QByteArray>
+@@ -914,67 +915,81 @@ void PortalInputCapture::handleZonesChanged(XdpInputCaptureSession *session, con
+ 
+   auto zones = xdp_input_capture_session_get_zones(session);
+ 
+-  // First pass: compute the bounding box (union) of all input-capture zones.
+-  // A pointer barrier must lie on the outer boundary of the combined desktop and
+-  // be adjacent to a single monitor edge. A barrier placed on an internal edge
+-  // between two adjacent monitors is rejected by the portal ("adjacent to
+-  // multiple monitor edges"), and a single rejected barrier fails the whole
+-  // barrier set - so on a multi-monitor server input capture never engages.
+-  gint unionLeft = 0;
+-  gint unionTop = 0;
+-  gint unionRight = 0;
+-  gint unionBottom = 0;
+-  bool boundsInit = false;
++  struct ZoneRect
++  {
++    gint x;
++    gint y;
++    gint w;
++    gint h;
++  };
++  std::vector<ZoneRect> rects;
+   for (auto z = zones; z != nullptr; z = z->next) {
+     guint w;
+     guint h;
+     gint x;
+     gint y;
+     g_object_get(z->data, "width", &w, "height", &h, "x", &x, "y", &y, nullptr);
+-    const gint right = x + static_cast<gint>(w);
+-    const gint bottom = y + static_cast<gint>(h);
+-    if (!boundsInit) {
+-      unionLeft = x;
+-      unionTop = y;
+-      unionRight = right;
+-      unionBottom = bottom;
+-      boundsInit = true;
+-    } else {
+-      unionLeft = std::min(unionLeft, x);
+-      unionTop = std::min(unionTop, y);
+-      unionRight = std::max(unionRight, right);
+-      unionBottom = std::max(unionBottom, bottom);
+-    }
++    rects.push_back({x, y, static_cast<gint>(w), static_cast<gint>(h)});
+   }
+ 
+-  // Second pass: only add a barrier for a zone edge that is part of the outer
+-  // boundary of the union (i.e. not an internal seam between two monitors).
++  // A pointer barrier must lie on an exterior edge: a zone edge with no other
++  // zone touching it from the other side. A barrier on an internal seam between
++  // two adjacent monitors is rejected by the portal ("adjacent to multiple
++  // monitor edges"), and a single rejected barrier fails the whole barrier set.
++  // Checking each edge (rather than only the union bounding box) also gives
++  // monitors of different sizes their own exterior edges, e.g. the bottom of a
++  // landscape monitor sitting next to a taller portrait one.
++  const auto overlaps = [](gint a1, gint a2, gint b1, gint b2) { return a1 < b2 && b1 < a2; };
++  const auto isExposed = [&rects, &overlaps](size_t self, BarrierSide side) {
++    const auto &r = rects[self];
++    for (size_t i = 0; i < rects.size(); ++i) {
++      if (i == self) {
++        continue;
++      }
++      const auto &o = rects[i];
++      switch (side) {
++      case BarrierSide::Left:
++        if (o.x + o.w == r.x && overlaps(r.y, r.y + r.h, o.y, o.y + o.h))
++          return false;
++        break;
++      case BarrierSide::Right:
++        if (o.x == r.x + r.w && overlaps(r.y, r.y + r.h, o.y, o.y + o.h))
++          return false;
++        break;
++      case BarrierSide::Top:
++        if (o.y + o.h == r.y && overlaps(r.x, r.x + r.w, o.x, o.x + o.w))
++          return false;
++        break;
++      case BarrierSide::Bottom:
++        if (o.y == r.y + r.h && overlaps(r.x, r.x + r.w, o.x, o.x + o.w))
++          return false;
++        break;
++      }
++    }
++    return true;
++  };
++
+   guint id = 0;
+-  while (zones != nullptr) {
+-    guint w;
+-    guint h;
+-    gint x;
+-    gint y;
+-    g_object_get(zones->data, "width", &w, "height", &h, "x", &x, "y", &y, nullptr);
++  for (size_t i = 0; i < rects.size(); ++i) {
++    const auto &[x, y, w, h] = rects[i];
+ 
+     LOG_DEBUG("input capture zone, %dx%d@%d,%d", w, h, x, y);
+ 
+-    if ((activeSides & static_cast<int>(LeftMask)) && x == unionLeft) {
++    if ((activeSides & static_cast<int>(LeftMask)) && isExposed(i, BarrierSide::Left)) {
+       addBarrier(++id, BarrierSide::Left, x, y, w, h);
+     }
+ 
+-    if ((activeSides & static_cast<int>(RightMask)) && (x + static_cast<gint>(w)) == unionRight) {
++    if ((activeSides & static_cast<int>(RightMask)) && isExposed(i, BarrierSide::Right)) {
+       addBarrier(++id, BarrierSide::Right, x, y, w, h);
+     }
+ 
+-    if ((activeSides & static_cast<int>(TopMask)) && y == unionTop) {
++    if ((activeSides & static_cast<int>(TopMask)) && isExposed(i, BarrierSide::Top)) {
+       addBarrier(++id, BarrierSide::Top, x, y, w, h);
+     }
+ 
+-    if ((activeSides & static_cast<int>(BottomMask)) && (y + static_cast<gint>(h)) == unionBottom) {
++    if ((activeSides & static_cast<int>(BottomMask)) && isExposed(i, BarrierSide::Bottom)) {
+       addBarrier(++id, BarrierSide::Bottom, x, y, w, h);
+     }
+-    zones = zones->next;
+   }
+ 
+   GList *list = nullptr;
