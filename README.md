@@ -61,9 +61,44 @@ back from the client puts the cursor on whichever monitor it's under.
   switching works from both monitors, in both directions.
 - Layouts whose outer edges already line up behave exactly as before.
 
+## Bonus patch: no capture toward disconnected clients
+
+`0003-portal-barriers-only-for-connected-neighbors.patch` stops an input "stutter" on Wayland servers.
+
+Deskflow 1.27 treats a side as active whenever the **layout** links a computer there, connected or
+not. With the InputCapture portal that's a problem: when the cursor reaches a barrier the portal grabs
+mouse and keyboard, the server finds nobody connected on that side and releases them, the cursor is
+still on the edge, and the barrier fires again. Here that was about 50 grab/release cycles a second
+(830 in one minute) while the cursor sat on the bottom edge with the `down` client switched off,
+which felt like the whole desktop pausing.
+
+The patch:
+
+- counts a side as active only if a **connected** client is linked there;
+- rebuilds the pointer barriers whenever the active sides change (a client connects or disconnects),
+  not only when monitors change;
+- switches input capture off entirely when no side has a connected client, instead of leaving the
+  old barriers live.
+
+With debug logging the server shows, for example:
+
+```
+DEBUG: no active input capture pointer barriers, disabling capture
+DEBUG: active sides: L (0x02)
+DEBUG: active sides changed, rebuilding input capture pointer barriers
+DEBUG: barrier (left) 1 at 0,0-0,1079
+DEBUG: enabling the portal input capture session
+```
+
+- Tested: two clients linked (`left` connected, `down` offline). Only the left barrier is created,
+  switching left works in both directions, and holding the cursor on the bottom edge no longer
+  stutters. Barriers appearing when the `down` client connects is not tested yet.
+- The server change (connected neighbors only) applies on every platform; on X11 and Windows it just
+  means edges with nobody connected stop being watched.
+
 ## Install (Arch Linux)
 
-`PKGBUILD` is Arch's official `deskflow` recipe plus both patches (pkgrel `2.2`, adds `wayland` and
+`PKGBUILD` is Arch's official `deskflow` recipe plus all three patches (pkgrel `2.3`, adds `wayland` and
 `wayland-protocols`).
 
 ```bash
@@ -95,6 +130,7 @@ git clone --branch v1.27.0 https://github.com/deskflow/deskflow
 cd deskflow
 git apply ../0001-wayland-data-control-clipboard.patch
 git apply ../0002-portal-barriers-on-exterior-edges.patch   # optional, see above
+git apply ../0003-portal-barriers-only-for-connected-neighbors.patch   # optional, needs 0002
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ```
 

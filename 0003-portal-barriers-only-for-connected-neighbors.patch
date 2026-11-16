@@ -1,0 +1,129 @@
+diff --git i/src/lib/platform/EiComputer.cpp w/src/lib/platform/EiComputer.cpp
+index 86c681b..77ddb56 100644
+--- i/src/lib/platform/EiComputer.cpp
++++ w/src/lib/platform/EiComputer.cpp
+@@ -210,9 +210,16 @@ void EiComputer::getCursorPos(int32_t &x, int32_t &y) const
+ 
+ void EiComputer::reconfigure(uint32_t activeSides)
+ {
+-  const static auto sidesText = sidesMaskToString(activeSides);
++  const auto sidesText = sidesMaskToString(activeSides);
+   LOG_DEBUG("active sides: %s (0x%02x)", sidesText.c_str(), activeSides);
++  const bool changed = activeSides != m_activeSides;
+   m_activeSides = activeSides;
++
++  // Pointer barriers are built from the active sides, so they must follow
++  // clients connecting and disconnecting, not only monitor layout changes.
++  if (changed && m_portalInputCapture != nullptr) {
++    m_portalInputCapture->refreshBarriers();
++  }
+ }
+ 
+ std::uint32_t EiComputer::activeSides()
+diff --git i/src/lib/platform/PortalInputCapture.cpp w/src/lib/platform/PortalInputCapture.cpp
+index b96f5f8..8492640 100644
+--- i/src/lib/platform/PortalInputCapture.cpp
++++ w/src/lib/platform/PortalInputCapture.cpp
+@@ -1007,10 +1007,29 @@ void PortalInputCapture::handleZonesChanged(XdpInputCaptureSession *session, con
+         this
+     );
+   } else {
+-    LOG_WARN("no input capture pointer barriers found");
++    // No side has a connected neighbor: switch capture off rather than leave
++    // the previous barrier set live. Barriers that fire with nowhere to send
++    // the cursor make the portal grab and release input in a tight loop.
++    LOG_DEBUG("no active input capture pointer barriers, disabling capture");
++    disable();
+   }
+ }
+ 
++void PortalInputCapture::refreshBarriers()
++{
++  g_idle_add(
++      [](gpointer data) -> gboolean {
++        auto *self = static_cast<PortalInputCapture *>(data);
++        if (self->m_session != nullptr) {
++          LOG_DEBUG("active sides changed, rebuilding input capture pointer barriers");
++          self->handleZonesChanged(self->m_session, nullptr);
++        }
++        return G_SOURCE_REMOVE;
++      },
++      this
++  );
++}
++
+ void PortalInputCapture::glibThread(const void *)
+ {
+   auto context = g_main_loop_get_context(m_glibMainLoop);
+diff --git i/src/lib/platform/PortalInputCapture.h w/src/lib/platform/PortalInputCapture.h
+index c2ed9db..d685add 100644
+--- i/src/lib/platform/PortalInputCapture.h
++++ w/src/lib/platform/PortalInputCapture.h
+@@ -40,6 +40,9 @@ public:
+   void clipboardChanged();
+   void enable();
+   void disable();
++  // Rebuild the pointer barriers from the computer's current active sides.
++  // Safe to call from any thread; the work runs on the glib thread.
++  void refreshBarriers();
+   void release();
+   void release(double x, double y);
+   bool isActive() const
+diff --git i/src/lib/server/Server.cpp w/src/lib/server/Server.cpp
+index 4d5465c..2420012 100644
+--- i/src/lib/server/Server.cpp
++++ w/src/lib/server/Server.cpp
+@@ -578,7 +578,25 @@ bool Server::hasAnyNeighbor(const BaseClientProxy *client, Direction dir) const
+ {
+   assert(client != nullptr);
+ 
+-  return m_config->hasNeighbor(getName(client), dir);
++  // Only a neighbor that is connected right now counts. Platforms that capture
++  // input with pointer barriers (the XDG input-capture portal) grab input as
++  // soon as the cursor reaches an active edge; if nobody is connected there the
++  // server immediately releases it, the cursor is still on the edge, and the
++  // barrier fires again, flapping capture dozens of times a second.
++  const std::string name = getName(client);
++  if (!m_config->hasNeighbor(name, dir)) {
++    return false;
++  }
++  for (auto link = m_config->beginNeighbor(name); link != m_config->endNeighbor(name); ++link) {
++    if (link->first.getSide() != dir) {
++      continue;
++    }
++    const auto neighbor = m_config->getCanonicalName(link->second.getName());
++    if (neighbor != name && m_clients.contains(neighbor)) {
++      return true;
++    }
++  }
++  return false;
+ }
+ 
+ BaseClientProxy *Server::getNeighbor(const BaseClientProxy *src, Direction dir, int32_t &x, int32_t &y) const
+@@ -1938,6 +1956,11 @@ bool Server::removeClient(BaseClientProxy *client)
+   m_clients.erase(getName(client));
+   m_clientSet.erase(i);
+ 
++  // the departed client no longer makes its edge active
++  if (m_primaryClient != nullptr && client != m_primaryClient) {
++    m_primaryClient->reconfigure(getActivePrimarySides());
++  }
++
+   return true;
+ }
+ 
+diff --git i/src/lib/server/Server.h w/src/lib/server/Server.h
+index 2bed086..3c1aa2a 100644
+--- i/src/lib/server/Server.h
++++ w/src/lib/server/Server.h
+@@ -235,8 +235,8 @@ private:
+   // on the direction.
+   void mapToPixel(const BaseClientProxy *, Direction, float f, int32_t &x, int32_t &y) const;
+ 
+-  // returns true if the client has a neighbor anywhere along the edge
+-  // indicated by the direction.
++  // returns true if the client has a connected neighbor anywhere along the
++  // edge indicated by the direction.
+   bool hasAnyNeighbor(const BaseClientProxy *, Direction) const;
+ 
+   // lookup neighboring computer, mapping the coordinate independent of
